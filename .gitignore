@@ -1,0 +1,11 @@
+# Secrets — NEVER commit. Contains SSH password and Camofox API keys.
+.env
+.env.bak*
+*.bak.*
+
+# Local overrides
+docker-compose.override.yml
+
+# Logs and scratch
+*.log
+tmp/

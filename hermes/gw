@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Control the Hermes gateway supervisor.
+#   gw status | start | stop | restart | log
+set -u
+
+FLAG=/root/.hermes/.gateway-disabled
+LOG=/var/log/hermes-gateway.log
+SUP=/usr/local/bin/gw-supervisor.sh
+
+sup_pid() { pgrep -f 'gw-supervisor\.sh' | head -1; }
+gw_pid()  { pgrep -f 'hermes gateway' | head -1; }
+
+case "${1:-status}" in
+  status)
+      s=$(sup_pid); g=$(gw_pid)
+      [ -n "$s" ] && echo "supervisor : RUNNING (pid $s)"   || echo "supervisor : NOT RUNNING"
+      [ -n "$g" ] && echo "gateway    : RUNNING (pid $g)"   || echo "gateway    : not running"
+      [ -f "$FLAG" ] && echo "state      : STOPPED via 'gw stop' — run 'gw start' to re-enable" \
+                     || echo "state      : enabled"
+      echo
+      echo "last log lines:"
+      tail -5 "$LOG" 2>/dev/null | sed 's/^/  /' || echo "  (no log yet)"
+      ;;
+  stop)
+      touch "$FLAG"
+      pkill -f 'hermes gateway' 2>/dev/null
+      echo "gateway stopped and disabled. Run 'gw start' to re-enable."
+      ;;
+  start)
+      rm -f "$FLAG"
+      if [ -z "$(sup_pid)" ]; then
+          nohup "$SUP" >/dev/null 2>&1 &
+          echo "supervisor started."
+      fi
+      echo "gateway enabled; it will come up within ~10s."
+      ;;
+  restart)
+      pkill -f 'hermes gateway' 2>/dev/null
+      echo "gateway killed; the supervisor will restart it shortly."
+      ;;
+  log)
+      tail -f "$LOG"
+      ;;
+  *)
+      echo "usage: gw {status|start|stop|restart|log}" >&2
+      exit 1
+      ;;
+esac

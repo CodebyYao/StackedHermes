@@ -1,0 +1,225 @@
+# Hermes Agent stack — 4 containers.
+#
+#   ollama        GPU inference backend (OpenAI-compatible API)
+#   hermes-agent  the agent itself; SSH-only, isolated from the host
+#   camofox       browser server backing Hermes' browsing tools
+#   portainer     container dashboard
+#
+# Every tunable lives in .env — copy .env.example to .env and edit it first.
+# Launch:  docker compose up -d --build
+#
+# Reference hardware for this config: 2x NVIDIA RTX 3090 (24 GB each, 48 GB
+# total), Ubuntu 24.04, driver 580. See the README for how to adapt it.
+
+name: hermes
+
+# ---------------------------------------------------------------------------
+# Shared GPU reservation.
+#
+# GPU_COUNT=all (the default) passes through EVERY GPU the host has, so this
+# works unchanged on 1, 2, 4 or 8 cards. Set GPU_COUNT to an integer in .env
+# to hand over only some of them, or set it to 0 to run CPU-only.
+# ---------------------------------------------------------------------------
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: ${GPU_COUNT:-all}
+            capabilities: [gpu]
+
+services:
+  # =========================================================================
+  # 1. Ollama — inference backend
+  # =========================================================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: hermes-ollama
+    hostname: ollama
+    restart: ${RESTART_POLICY:-no}
+    <<: *gpu
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      # Split one model across ALL GPUs instead of requiring it to fit on one.
+      #   0 = pack onto the fewest cards (faster when the model fits on one)
+      #   1 = spread across every card (needed when it does not)
+      # Single-GPU hosts should leave this 0. See the README's sizing table.
+      OLLAMA_SCHED_SPREAD: ${OLLAMA_SCHED_SPREAD:-0}
+      # How many models stay resident. Raise it only if your VRAM can hold them.
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-15m}
+      # Flash attention needs Ampere (SM 8.0+). Big KV-cache saving at long
+      # context. Set to 0 on Turing/Pascal or older.
+      OLLAMA_FLASH_ATTENTION: ${OLLAMA_FLASH_ATTENTION:-1}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      # Loopback only. The agent reaches this over hermes-net, not via the host.
+      - "127.0.0.1:${OLLAMA_PORT:-11434}:11434"
+    networks:
+      - hermes-net
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # =========================================================================
+  # 2. Camofox — browser server for Hermes' browsing tools
+  # =========================================================================
+  camofox:
+    build:
+      # Built straight from the git URL — no clone step needed.
+      # Dockerfile.ci is the self-contained variant; the repo's default
+      # Dockerfile requires binaries pre-downloaded into dist/ via `make fetch`
+      # and bind mounts, which does not work from a git build context.
+      context: https://github.com/jo-inc/camofox-browser.git#master
+      dockerfile: Dockerfile.ci
+    image: hermes-camofox:local
+    container_name: hermes-camofox
+    hostname: camofox
+    restart: ${RESTART_POLICY:-no}
+    # Firefox crashes on Docker's default 64 MB /dev/shm.
+    shm_size: ${CAMOFOX_SHM_SIZE:-2gb}
+    environment:
+      CAMOFOX_PORT: "9377"
+      # Default V8 heap is 128 MB, which is tight for real browsing sessions.
+      MAX_OLD_SPACE_SIZE: ${CAMOFOX_HEAP_MB:-512}
+      CAMOFOX_API_KEY: ${CAMOFOX_API_KEY:?set CAMOFOX_API_KEY in .env}
+      CAMOFOX_ADMIN_KEY: ${CAMOFOX_ADMIN_KEY:?set CAMOFOX_ADMIN_KEY in .env}
+      ENABLE_VNC: ${CAMOFOX_ENABLE_VNC:-1}
+      VNC_PASSWORD: ${VNC_PASSWORD:?set VNC_PASSWORD in .env}
+      NOVNC_PORT: "6080"
+      # No telemetry leaves this box.
+      CAMOFOX_CRASH_REPORT_ENABLED: "false"
+    volumes:
+      - camofox_data:/root/.camofox
+    ports:
+      - "127.0.0.1:${CAMOFOX_PORT:-9377}:9377"
+      - "127.0.0.1:${NOVNC_PORT:-6080}:6080"
+    networks:
+      - hermes-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9377/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+
+  # =========================================================================
+  # 3. Hermes Agent — the isolated box you SSH into
+  # =========================================================================
+  hermes-agent:
+    build:
+      context: ./hermes
+      dockerfile: Dockerfile
+      args:
+        # Match this to what your NVIDIA driver supports — see hermes/Dockerfile.
+        CUDA_IMAGE: ${CUDA_IMAGE:-nvidia/cuda:12.6.3-devel-ubuntu24.04}
+    image: hermes-agent:local
+    container_name: hermes-agent
+    hostname: hermes-agent
+    restart: ${RESTART_POLICY:-no}
+    <<: *gpu
+    environment:
+      SSH_PASSWORD: ${SSH_PASSWORD:?set SSH_PASSWORD in .env}
+      SSH_PORT: ${SSH_PORT:-22022}
+      OLLAMA_HOST: http://ollama:11434
+      OPENAI_BASE_URL: http://ollama:11434/v1
+      CAMOFOX_URL: http://camofox:9377
+      CAMOFOX_API_KEY: ${CAMOFOX_API_KEY}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      # Named volumes ONLY — deliberately no bind mount of the host filesystem.
+      # Move files with `docker compose cp` or `scp -P <SSH_PORT>`.
+      - hermes_home:/root/.hermes
+      - hermes_workspace:/workspace
+    ports:
+      # Defaults to loopback. Set SSH_BIND=0.0.0.0 in .env to reach it from
+      # your LAN — read the README's security section before you do.
+      - "${SSH_BIND:-127.0.0.1}:${SSH_PORT:-22022}:22"
+    networks:
+      # NOT on mgmt-net: the agent cannot reach Portainer or the Docker socket.
+      - hermes-net
+    depends_on:
+      ollama:
+        condition: service_healthy
+      camofox:
+        condition: service_healthy
+    # --- isolation / hardening ---
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN          # sshd + chpasswd
+      - SETUID         # sshd privilege separation
+      - SETGID
+      - SYS_CHROOT     # sshd privilege separation
+      - DAC_OVERRIDE
+      - FOWNER
+      - AUDIT_WRITE    # sshd writes login records
+      - KILL
+      - NET_BIND_SERVICE
+      - NET_ADMIN      # fail2ban iptables rules (container-local only)
+      - NET_RAW
+    pids_limit: ${AGENT_PIDS_LIMIT:-4096}
+    mem_limit: ${AGENT_MEM_LIMIT:-16g}
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    tty: true
+    stdin_open: true
+
+  # =========================================================================
+  # 4. Portainer — dashboard. Isolated on its own network.
+  # =========================================================================
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: hermes-portainer
+    hostname: portainer
+    restart: ${RESTART_POLICY:-no}
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - portainer_data:/data
+      # Read-only socket: enough to view status, without handing over write
+      # access to the daemon API. Drop the :ro if you want to stop/restart
+      # containers from the Portainer UI.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "127.0.0.1:${PORTAINER_PORT:-9443}:9443"
+    networks:
+      # mgmt-net only. hermes-agent is not on this network and cannot route here.
+      - mgmt-net
+
+networks:
+  hermes-net:
+    driver: bridge
+    ipam:
+      config:
+        # Pinned so the DOCKER-USER rule in install-prereqs.sh (which blocks
+        # this subnet from reaching the host gateway) stays valid across
+        # `docker compose down` / `up` cycles. If you change these, re-run
+        # install-prereqs.sh so the firewall rule matches.
+        - subnet: ${HERMES_SUBNET:-172.28.0.0/16}
+          gateway: ${HERMES_GATEWAY:-172.28.0.1}
+  mgmt-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${MGMT_SUBNET:-172.29.0.0/16}
+          gateway: ${MGMT_GATEWAY:-172.29.0.1}
+
+volumes:
+  ollama_models:
+  hermes_home:
+  hermes_workspace:
+  camofox_data:
+  portainer_data:
